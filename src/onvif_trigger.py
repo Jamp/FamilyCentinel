@@ -37,16 +37,17 @@ import time
 from collections import defaultdict
 from typing import Optional
 
+from lxml import etree
 from onvif import ONVIFCamera
-from zeep.helpers import serialize_object
 
 from src.config import CameraConfig, OnvifTriggerConfig
 
 log = logging.getLogger(__name__)
 
-# Topic ONVIF estándar para detección de movimiento por celdas (cell motion).
-# Es el que publica Thingino y la mayoría de firmwares ONVIF Profile S.
-_MOTION_TOPIC_FRAGMENT = "Motion"
+# Namespace del schema ONVIF — usado para parsear el XML de Message con lxml.
+# Thingino no incluye el Topic en las notificaciones, así que no filtramos por él;
+# en cambio buscamos directamente los SimpleItem por nombre.
+_ONVIF_NS = "http://www.onvif.org/ver10/schema"
 
 # Nombres de SimpleItem que indican estado de movimiento. ONVIF estándar usa
 # `IsMotion` (booleano). Algunos firmwares emiten `State` con el mismo semántico.
@@ -232,14 +233,17 @@ class OnvifTrigger:
         # las desplazamos a un threadpool para no bloquear el loop.
         cam = await asyncio.to_thread(ONVIFCamera, host, port, user, password)
         await asyncio.to_thread(cam.update_xaddrs)
-        await asyncio.to_thread(cam.create_pullpoint_subscription)
+
+        # CreatePullPointSubscription registra a FamilyCentinel como subscriber.
+        # Sin esta llamada, PullMessages devuelve siempre vacío porque la cámara
+        # no tiene ningún subscriber al que encolar eventos.
+        events = cam.create_events_service()
+        await asyncio.to_thread(
+            events.CreatePullPointSubscription,
+            {"InitialTerminationTime": "PT1H"},
+        )
         service = cam.create_pullpoint_service()
         log.info("ONVIF[%s] PullPoint subscription created on %s:%d", camera_name, host, port)
-
-        # Reset del backoff: si llegamos aquí, la conexión inicial fue OK.
-        # El backoff se gestiona en `_camera_task` envolviendo esta función,
-        # así que devolvemos el control sólo en parada o en excepción.
-        backoff_signal = _BACKOFF_INITIAL_S  # noqa: F841 — documentación de intent
 
         while not self._stop_event.is_set():
             messages = await asyncio.to_thread(
@@ -256,33 +260,29 @@ class OnvifTrigger:
                 self._handle_notification(camera_name, msg)
 
     def _handle_notification(self, camera_name: str, msg: object) -> None:
-        """Extrae IsMotion del NotificationMessage y actualiza el estado."""
-        topic = getattr(getattr(msg, "Topic", None), "_value_1", "") or ""
-        if _MOTION_TOPIC_FRAGMENT not in topic:
+        """Extrae IsMotion del NotificationMessage y actualiza el estado.
+
+        Thingino no incluye el Topic en las notificaciones, así que en lugar de
+        filtrar por topic usamos lxml para buscar directamente los SimpleItem
+        en el elemento Data del mensaje.
+        """
+        elem = getattr(getattr(msg, "Message", None), "_value_1", None)
+        if elem is None:
             return
 
-        try:
-            data = serialize_object(msg.Message._value_1)
-        except (AttributeError, TypeError):
-            log.debug("ONVIF[%s] message without parseable payload — topic=%s", camera_name, topic)
+        # Buscar todos los SimpleItem bajo tt:Data
+        data_el = elem.find(f"{{{_ONVIF_NS}}}Data")
+        if data_el is None:
             return
 
-        items = (data or {}).get("Data", {}).get("SimpleItem", [])
-        # SimpleItem puede venir como dict (un solo item) o como lista. Normalizamos.
-        if isinstance(items, dict):
-            items = [items]
-        elif not isinstance(items, list):
-            return
-
-        for item in items:
-            name = item.get("Name") if isinstance(item, dict) else None
+        for item in data_el.findall(f"{{{_ONVIF_NS}}}SimpleItem"):
+            name = item.get("Name")
             if name not in _MOTION_ITEM_NAMES:
                 continue
 
-            value = item.get("Value")
-            # ONVIF transporta booleanos como strings "true"/"false". Algunos
-            # parsers de zeep ya los convierten a bool.
-            is_motion = value is True or (isinstance(value, str) and value.lower() == "true")
+            value = item.get("Value", "")
+            # ONVIF transporta booleanos como strings "true"/"false".
+            is_motion = value.lower() == "true"
 
             if not is_motion:
                 # Sólo nos interesa el flanco de subida: "stop motion" no
