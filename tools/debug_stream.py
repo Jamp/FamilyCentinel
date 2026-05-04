@@ -41,7 +41,6 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import paho.mqtt.client as mqtt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -62,85 +61,6 @@ _COLORS = {
     "unknown": (180, 180, 180),  # gris
 }
 _TEXT_BG = (20, 20, 20)
-
-
-# ---------------------------------------------------------------------------
-# Listener MQTT para motion sensor de Thingino
-# ---------------------------------------------------------------------------
-class MotionSensorListener:
-    """Suscribe a los topics de movimiento Thingino y expone el estado actual.
-
-    Cada topic que publica "ON" queda marcado como activo durante
-    `ttl_seconds`. Pasado ese tiempo sin nuevo "ON", vuelve a inactivo.
-    """
-
-    def __init__(self, ttl_seconds: float = 10.0) -> None:
-        self._ttl = ttl_seconds
-        self._lock = threading.Lock()
-        # topic → (timestamp_último_ON, label_corto)
-        self._active: dict[str, tuple[float, str]] = {}
-
-    def connect(self, cfg: AppConfig) -> None:
-        topics = list(cfg.motion_trigger.global_topics)
-        for cam in cfg.cameras:
-            if cam.motion_topic:
-                topics.append(cam.motion_topic)
-        if not topics or not cfg.mqtt.host:
-            return
-
-        client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"fc-debug-motion-{int(time.time())}",
-            clean_session=True,
-        )
-        if cfg.mqtt.username:
-            client.username_pw_set(cfg.mqtt.username, cfg.mqtt.password)
-
-        def on_connect(cl, *_):
-            for t in topics:
-                cl.subscribe(t, qos=0)
-            log.info("MotionSensorListener suscrito a: %s", topics)
-
-        def on_message(cl, ud, msg):
-            payload = msg.payload.decode("utf-8", errors="replace").strip().upper()
-            topic = msg.topic
-            parts = topic.split("/")
-            # Etiqueta: segundo segmento del topic (nombre de cámara o MAC corto)
-            label = parts[1] if len(parts) >= 2 else topic
-            label = label[-12:]
-            with self._lock:
-                if payload in ("ON", "1", "TRUE", "MOTION"):
-                    self._active[topic] = (time.monotonic(), label)
-                else:
-                    # Limpiar tanto la clave exacta como cualquier topic
-                    # del mismo dispositivo (p.ej. motion/state OFF limpia motion ON)
-                    device = parts[1] if len(parts) >= 2 else ""
-                    to_del = [
-                        k for k in self._active
-                        if k == topic or (device and k.split("/")[1] == device)
-                    ]
-                    for k in to_del:
-                        del self._active[k]
-
-        client.on_connect = on_connect
-        client.on_message = on_message
-        client.loop_start()
-        try:
-            client.connect(cfg.mqtt.host, cfg.mqtt.port, keepalive=30)
-        except Exception as exc:
-            log.warning("MotionSensorListener: no se pudo conectar al broker — %s", exc)
-
-    def active_labels(self) -> list[str]:
-        """Devuelve etiquetas de los sensores activos dentro del TTL."""
-        now = time.monotonic()
-        with self._lock:
-            return [
-                label for topic, (ts, label) in list(self._active.items())
-                if now - ts < self._ttl
-            ]
-
-
-_motion_sensor = MotionSensorListener(ttl_seconds=4.0)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +262,7 @@ def _annotate_detections(
 
 
 def _draw_overlay(frame: np.ndarray, camera_name: str, fps: float, stats: str) -> None:
-    """Dibuja barra de estado e indicador de motion sensor Thingino."""
+    """Dibuja barra de estado: timestamp, nombre de cámara, FPS y stats."""
     ts = time.strftime("%H:%M:%S")
     lines = [
         f"{camera_name}  {ts}  {fps:.1f}fps",
@@ -354,35 +274,6 @@ def _draw_overlay(frame: np.ndarray, camera_name: str, fps: float, stats: str) -
             frame, line, (4, y),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA,
         )
-
-    # Indicador de motion sensor Thingino (esquina superior derecha)
-    active = _motion_sensor.active_labels()
-    h, w = frame.shape[:2]
-    if active:
-        label = "SENSOR: " + "  ".join(active)
-        color = (0, 60, 255)        # rojo vivo
-        dot_color = (0, 80, 255)
-    else:
-        label = "SENSOR: OFF"
-        color = (80, 80, 80)
-        dot_color = (60, 60, 60)
-
-    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-    x = w - tw - 22
-    y = 18
-    # Fondo semitransparente
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x - 6, y - th - 4), (w - 4, y + 4), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    # Punto parpadeante (usando segundo par)
-    dot_x = x - 14
-    dot_y = y - th // 2
-    cv2.circle(frame, (dot_x, dot_y), 5, dot_color, -1, cv2.LINE_AA)
-    cv2.putText(frame, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-
-    # Si hay movimiento activo: borde rojo en el frame completo
-    if active:
-        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 60, 255), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -459,8 +350,6 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-
-    _motion_sensor.connect(cfg)
 
     log.info("Loading detector (use_tpu=%s)…", args.use_tpu)
     detector = Detector(

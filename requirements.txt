@@ -29,3 +29,7 @@ PyYAML>=6.0.1,<7.0.0
 
 # Operaciones numericas (bbox arithmetic).
 numpy>=1.26.0,<3.0.0
+
+# Cliente ONVIF (PullPoint subscriptions). onvif-zeep es el fork mantenido
+# tras el abandono de python-onvif. Trae zeep como dependencia transitiva.
+onvif-zeep>=0.2.12

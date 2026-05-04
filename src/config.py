@@ -54,11 +54,34 @@ def _mask_secret(value: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class OnvifCameraConfig:
+    """Configuración ONVIF de una cámara individual.
+
+    Si `host` está vacío, la cámara se ignora desde el punto de vista de
+    ONVIF (no se crea suscripción PullPoint).
+
+    SEGURIDAD: crear un usuario ONVIF dedicado con permisos mínimos en el
+    firmware (Thingino: System → Users). NO reutilizar el usuario admin/root.
+    """
+    host: str = ""
+    port: int = 80
+    username: str = ""
+    password: str = ""
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"OnvifCameraConfig(host={self.host!r}, port={self.port}, "
+            f"username={self.username!r}, password=***)"
+        )
+
+
+@dataclass
 class CameraConfig:
     """Configuración de una cámara individual.
 
     Multi-cámara: añadir una entrada por cámara en la sección `cameras:` del
-    YAML. Cada cámara puede tener su propio topic Thingino en `motion_topic`.
+    YAML. Cada cámara puede tener su propio bloque `onvif:` para el trigger
+    de movimiento por PullPoint.
 
     Compatibilidad: si se usa la sección `camera:` (singular, versión antigua),
     se convierte automáticamente a una lista con un elemento.
@@ -87,16 +110,15 @@ class CameraConfig:
     # Segundos entre reintentos de conexión tras un fallo.
     reconnect_delay_s: float = 5.0
 
-    # Topic MQTT de Thingino para el trigger de movimiento de ESTA cámara.
-    # Dejar vacío ("") si no se usa trigger de movimiento para esta cámara.
-    # Formato Thingino: thingino/<nombre_camara>
-    motion_topic: str = ""
+    # Configuración ONVIF para el trigger de movimiento.
+    # Si `onvif.host` queda vacío, esta cámara no participa en el trigger.
+    onvif: OnvifCameraConfig = field(default_factory=OnvifCameraConfig)
 
     def __repr__(self) -> str:  # pragma: no cover
         return (
             f"CameraConfig(name={self.name!r}, type={self.type!r}, "
             f"url={mask_rtsp_url(self.url)!r}, target_fps={self.target_fps}, "
-            f"motion_topic={self.motion_topic!r})"
+            f"onvif={self.onvif!r})"
         )
 
 
@@ -162,31 +184,23 @@ class StabilizationConfig:
 
 
 @dataclass
-class MotionTriggerConfig:
-    """Puerta de movimiento basada en eventos MQTT de Thingino.
+class OnvifTriggerConfig:
+    """Puerta de movimiento basada en suscripciones ONVIF PullPoint.
 
-    Cuando está activo, el Edge TPU sólo procesa frames mientras alguna de las
-    cámaras haya detectado movimiento recientemente (dentro de `cooldown_seconds`).
-    Esto reduce drásticamente el consumo de CPU/TPU en periodos sin actividad.
+    Cuando está activa, el Edge TPU sólo procesa frames mientras alguna de
+    las cámaras haya reportado movimiento por ONVIF dentro de los últimos
+    `cooldown_seconds`. Reduce drásticamente el consumo de CPU/TPU en
+    periodos sin actividad.
 
-    Cada cámara puede tener su propio topic configurado en `CameraConfig.motion_topic`.
-    Esta sección también soporta topics globales (que no están asociados a una cámara
-    concreta) en `global_topics`.
+    Cada cámara configura sus credenciales ONVIF en `CameraConfig.onvif`.
 
-    CONFIGURACIÓN EN THINGINO (una vez por cámara):
-      1. Abre la web UI: http://<IP_CAMARA>
-      2. Ve a: Tools → Motion Guard
-      3. Activa "Motion Guard" y marca "Send to MQTT"
-      4. Configura el mismo broker MQTT de FamilyCentinel
-      5. Anota el topic (por defecto: thingino/<nombre_camara>)
-      6. Pon ese topic en `cameras[n].motion_topic` del config.yaml
+    HABILITAR ONVIF EN THINGINO:
+      1. Web UI → Configuration → Network Services
+      2. Activa "ONVIF" y opcionalmente fija el puerto (por defecto 80)
+      3. Crea un usuario ONVIF dedicado en System → Users
     """
-    # False = procesar todos los frames siempre (comportamiento original).
-    enabled: bool = False
-
-    # Topics globales opcionales (cualquier evento en ellos activa TODAS las cámaras).
-    # Útil si tienes un sensor PIR externo o quieres un topic maestro de activación.
-    global_topics: list[str] = field(default_factory=list)
+    # False = procesar todos los frames siempre (comportamiento pass-through).
+    enabled: bool = True
 
     # Segundos que el TPU permanece activo tras el último evento de movimiento.
     # Aumentar si hay personas que se mueven lentamente y se pierden detecciones.
@@ -246,7 +260,7 @@ class AppConfig:
     cameras: list[CameraConfig] = field(default_factory=lambda: [CameraConfig()])
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     stabilization: StabilizationConfig = field(default_factory=StabilizationConfig)
-    motion_trigger: MotionTriggerConfig = field(default_factory=MotionTriggerConfig)
+    onvif_trigger: OnvifTriggerConfig = field(default_factory=OnvifTriggerConfig)
     mqtt: MqttConfig = field(default_factory=MqttConfig)
     model_path: Path = Path("/app/models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite")
     labels_path: Path = Path("/app/models/coco_labels.txt")
@@ -287,9 +301,17 @@ def _merge_env(cfg: AppConfig) -> None:
         setattr(section_obj, key, value)
 
 
+def _build_camera(raw: dict) -> CameraConfig:
+    """Construye un `CameraConfig` traduciendo el bloque `onvif:` anidado."""
+    onvif_raw = raw.pop("onvif", None) or {}
+    if not isinstance(onvif_raw, dict):
+        raise ValueError("`onvif` block in camera config must be a mapping")
+    onvif_obj = OnvifCameraConfig(**onvif_raw) if onvif_raw else OnvifCameraConfig()
+    return CameraConfig(onvif=onvif_obj, **raw)
+
+
 def _parse_cameras(raw: dict) -> list[CameraConfig]:
     """Parsea `cameras:` (lista) o `camera:` (singular, legacy) del YAML."""
-    # Formato nuevo: cameras es una lista
     cameras_raw = raw.get("cameras")
     if cameras_raw is not None:
         if not isinstance(cameras_raw, list):
@@ -298,18 +320,18 @@ def _parse_cameras(raw: dict) -> list[CameraConfig]:
         for i, cam in enumerate(cameras_raw):
             if not isinstance(cam, dict):
                 raise ValueError(f"`cameras[{i}]` must be a mapping")
-            # Asignar nombre por defecto si no se especifica
+            cam = dict(cam)  # copia defensiva: _build_camera hace pop()
             if "name" not in cam:
                 cam["name"] = f"cam{i}"
-            result.append(CameraConfig(**cam))
+            result.append(_build_camera(cam))
         return result
 
-    # Formato legacy: camera es un dict singular — convertir a lista
     camera_raw = raw.get("camera", {}) or {}
     if camera_raw:
+        camera_raw = dict(camera_raw)
         if "name" not in camera_raw:
             camera_raw["name"] = "default"
-        return [CameraConfig(**camera_raw)]
+        return [_build_camera(camera_raw)]
 
     return [CameraConfig()]
 
@@ -340,7 +362,7 @@ def load_config(config_path) -> AppConfig:
     # Secciones opcionales — usar dict vacío como fallback seguro
     det_raw    = raw.get("detection", {}) or {}
     stab_raw   = raw.get("stabilization", {}) or {}
-    motion_raw = raw.get("motion_trigger", {}) or {}
+    onvif_raw  = raw.get("onvif_trigger", {}) or {}
     mqtt_raw   = raw.get("mqtt", {}) or {}
     tls_raw    = mqtt_raw.pop("tls", {}) if isinstance(mqtt_raw, dict) else {}
     tls_raw    = tls_raw or {}
@@ -355,7 +377,7 @@ def load_config(config_path) -> AppConfig:
         cameras=_parse_cameras(raw),
         detection=DetectionConfig(**det_raw) if det_raw else DetectionConfig(),
         stabilization=StabilizationConfig(**stab_raw) if stab_raw else StabilizationConfig(),
-        motion_trigger=MotionTriggerConfig(**motion_raw) if motion_raw else MotionTriggerConfig(),
+        onvif_trigger=OnvifTriggerConfig(**onvif_raw) if onvif_raw else OnvifTriggerConfig(),
         mqtt=mqtt_obj,
         model_path=Path(raw.get("model_path", AppConfig.model_path)),
         labels_path=Path(raw.get("labels_path", AppConfig.labels_path)),
@@ -386,8 +408,8 @@ def load_config(config_path) -> AppConfig:
         )
 
     log.info(
-        "Config loaded: %d camera(s), motion_trigger=%s",
+        "Config loaded: %d camera(s), onvif_trigger=%s",
         len(cfg.cameras),
-        cfg.motion_trigger.enabled,
+        cfg.onvif_trigger.enabled,
     )
     return cfg

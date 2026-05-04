@@ -1,27 +1,17 @@
 """Monitor de consola para estados MQTT de FamilyCentinel en tiempo real.
 
 Muestra en la terminal los cambios de estado de todos los sensores de
-FamilyCentinel y los eventos de movimiento Thingino. Útil para verificar
-que el sistema funciona antes de configurar automatizaciones en HA.
+FamilyCentinel. Útil para verificar que el sistema funciona antes de
+configurar automatizaciones en HA.
+
+Nota: el monitor de eventos de movimiento Thingino MQTT se eliminó al
+migrar el trigger a ONVIF PullPoint (los eventos ya no pasan por MQTT).
 
 USO:
     python tools/mqtt_monitor.py --config config.yaml
 
     # O especificando el broker directamente:
     python tools/mqtt_monitor.py --host 192.168.1.10 --port 1883
-
-SALIDA DE EJEMPLO:
-    ┌─────────────────────────────────────────────────────┐
-    │  FamilyCentinel MQTT Monitor                         │
-    │  Broker: 192.168.1.10:1883   Ctrl+C para salir      │
-    └─────────────────────────────────────────────────────┘
-    [14:32:01] STATUS     familycentinel/status → online
-    [14:32:01] SENSOR     familycentinel/adult/state → OFF
-    [14:32:01] SENSOR     familycentinel/child/state → OFF
-    [14:32:01] SENSOR     familycentinel/dog/state   → OFF
-    [14:32:15] MOTION     thingino/salon → {"camera_id":"abc","ts":"1234"}
-    [14:32:18] SENSOR ✓   familycentinel/adult/state → ON   (cambió)
-    [14:33:01] SENSOR     familycentinel/adult/state → OFF
 """
 from __future__ import annotations
 
@@ -87,7 +77,6 @@ def build_client(
     username: str | None,
     password: str | None,
     device_id: str,
-    motion_topics: list[str],
 ) -> mqtt.Client:
 
     client = mqtt.Client(
@@ -101,13 +90,10 @@ def build_client(
 
     def on_connect(cl, userdata, flags, rc, props):
         if rc == 0:
-            # Suscribirse a todos los topics relevantes de FamilyCentinel
             topics = [
                 (f"{device_id}/+/state", 1),    # estados de sensores
-                (f"{device_id}/status", 1),       # LWT online/offline
+                (f"{device_id}/status", 1),     # LWT online/offline
             ]
-            for t in motion_topics:
-                topics.append((t, 1))
             cl.subscribe(topics)
             print(f"\n{_C['cyan']}Conectado a {host}:{port}{_C['reset']}")
             print(f"{_C['gray']}Escuchando: {[t for t, _ in topics]}{_C['reset']}\n")
@@ -122,12 +108,9 @@ def build_client(
         _prev_states[topic] = payload
 
         if "/state" in topic and device_id in topic:
-            sensor = topic.split("/")[1] if "/" in topic else topic
             _print_row("SENSOR", topic, payload, changed)
         elif "status" in topic and device_id in topic:
             _print_row("STATUS", topic, payload)
-        elif any(t == topic for t in motion_topics):
-            _print_row("MOTION", topic, payload[:60])
         else:
             _print_row("OTHER", topic, payload[:60])
 
@@ -158,19 +141,15 @@ def main() -> None:
     password = args.password or cfg.mqtt.password
     device_id = cfg.mqtt.device_id
 
-    motion_topics = [c.motion_topic for c in cfg.cameras if c.motion_topic]
-    if cfg.motion_trigger.global_topics:
-        motion_topics += cfg.motion_trigger.global_topics
-
     print(f"""
 {_C['bold']}┌──────────────────────────────────────────────────────┐
 │  FamilyCentinel MQTT Monitor                          │
 │  Broker: {host}:{port:<5}   Ctrl+C para salir      │
 └──────────────────────────────────────────────────────┘{_C['reset']}
-{_C['gray']}Leyenda:  SENSOR (verde=ON, rojo=OFF)  MOTION (amarillo)  ✓=cambio{_C['reset']}
+{_C['gray']}Leyenda:  SENSOR (verde=ON, rojo=OFF)  ✓=cambio{_C['reset']}
 """)
 
-    client = build_client(host, port, username, password, device_id, motion_topics)
+    client = build_client(host, port, username, password, device_id)
 
     try:
         client.connect(host, port, keepalive=30)

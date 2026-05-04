@@ -34,3 +34,6 @@ PyYAML>=6.0.1
 
 # Numérico
 numpy>=1.26.0,<3.0.0
+
+# Cliente ONVIF (PullPoint subscriptions).
+onvif-zeep>=0.2.12

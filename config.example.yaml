@@ -25,7 +25,7 @@
 #
 # Añadir una entrada por cámara. Cada cámara:
 #   - Corre en su propio producer thread RTSP
-#   - Puede tener su propio topic de movimiento Thingino
+#   - Puede tener su propio bloque ONVIF para el trigger de movimiento
 #   - Comparte el único Coral Edge TPU (procesamiento secuencial)
 #
 # COMPATIBILIDAD LEGACY: si tienes una sola cámara y usabas `camera:` (singular)
@@ -51,10 +51,14 @@ cameras:
     height: 480
     reconnect_delay_s: 5.0    # Segundos entre reintentos de conexión
 
-    # Topic MQTT de Thingino para el trigger de movimiento de ESTA cámara.
-    # Dejar vacío si no usas trigger de movimiento con esta cámara.
-    # Configurar en Thingino: Tools → Motion Guard → Send to MQTT
-    motion_topic: "thingino/salon"
+    # ONVIF PullPoint (trigger de movimiento). Dejar `host: ""` si no se usa.
+    # En Thingino: Configuration → Network Services → ONVIF (activar)
+    # Crear usuario ONVIF dedicado en System → Users (NO usar root).
+    onvif:
+      host: 192.168.1.101     # Misma IP que la URL RTSP, normalmente
+      port: 80                # Puerto web de Thingino (donde escucha ONVIF)
+      username: onvif_user    # Usuario ONVIF dedicado (no usar root)
+      password: CAMBIAME_ONVIF_PASSWORD
 
   # ---- Cámara 2: entrada -----------------------------------------------------
   - name: entrada
@@ -64,7 +68,11 @@ cameras:
     width: 640
     height: 480
     reconnect_delay_s: 5.0
-    motion_topic: "thingino/entrada"
+    onvif:
+      host: 192.168.1.102
+      port: 80
+      username: onvif_user
+      password: CAMBIAME_ONVIF_PASSWORD
 
   # ---- Plantilla para más cámaras (descomentar y rellenar) -------------------
   # - name: cocina
@@ -74,9 +82,13 @@ cameras:
   #   width: 640
   #   height: 480
   #   reconnect_delay_s: 5.0
-  #   motion_topic: "thingino/cocina"
+  #   onvif:
+  #     host: 192.168.1.103
+  #     port: 80
+  #     username: onvif_user
+  #     password: CAMBIAME_ONVIF_PASSWORD
 
-  # ---- Cámara USB (fallback sin red) -----------------------------------------
+  # ---- Cámara USB (fallback sin red, sin ONVIF) ------------------------------
   # - name: usb_local
   #   type: usb
   #   device_index: 0          # /dev/video0
@@ -84,7 +96,7 @@ cameras:
   #   width: 640
   #   height: 480
   #   reconnect_delay_s: 3.0
-  #   motion_topic: ""          # Sin trigger de movimiento para USB
+  #   # Sin bloque `onvif:` → esta cámara no aporta señal de movimiento.
 
 
 # -----------------------------------------------------------------------------
@@ -137,45 +149,41 @@ stabilization:
 
 
 # -----------------------------------------------------------------------------
-# DISPARO POR MOVIMIENTO (Thingino)
+# DISPARO POR MOVIMIENTO (ONVIF PullPoint)
 #
 # Cuando está activo, el Edge TPU sólo procesa frames mientras alguna de las
-# cámaras haya detectado movimiento recientemente. Esto puede reducir el
-# consumo de CPU/TPU hasta un 90% en hogares con pocas horas de actividad.
+# cámaras haya reportado movimiento por ONVIF recientemente. Esto puede
+# reducir el consumo de CPU/TPU hasta un 90% en hogares con pocas horas de
+# actividad.
 #
-# CONFIGURACIÓN EN THINGINO (una vez por cámara, 5 minutos):
+# ONVIF PullPoint es el mecanismo estándar (WS-BaseNotification) implementado
+# por Thingino, Hikvision, Dahua, Reolink y prácticamente cualquier cámara IP
+# moderna. Es mucho más fiable que el antiguo trigger MQTT de Thingino:
+#   - No depende del broker MQTT (la cámara habla directamente con FamilyCentinel)
+#   - Reconexión automática con backoff exponencial
+#   - Topic estándar: tns1:RuleEngine/CellMotionDetector/Motion
+#
+# CONFIGURACIÓN EN THINGINO (una vez por cámara, 2 minutos):
 #   1. Abre http://<IP_CAMARA> (web UI de Thingino)
-#   2. Ve a: Tools → Motion Guard
-#   3. Activa "Motion Guard"
-#   4. Marca la casilla "Send to MQTT"
-#   5. Configura:
-#        Host: <IP del broker MQTT de Home Assistant>
-#        Port: 1883
-#        Usuario/contraseña: los mismos que FamilyCentinel
-#        Topic: thingino/<nombre_camara>  (p.ej. thingino/salon)
-#   6. Copia ese topic en `cameras[n].motion_topic` más arriba
+#   2. Ve a: Configuration → Network Services
+#   3. Activa "ONVIF" (puerto por defecto: 80)
+#   4. Crea un usuario ONVIF dedicado: System → Users (NO usar root)
+#   5. Pon esas credenciales en el bloque `onvif:` de cada cámara más arriba
 #
 # DIAGRAMA DE FLUJO:
-#   Thingino detecta movimiento
-#     → publica mensaje a thingino/<camara>
-#       → FamilyCentinel activa el TPU para esa cámara durante cooldown_seconds
-#         → al expirar el cooldown sin nuevo movimiento, el TPU vuelve a dormir
+#   Thingino detecta movimiento (Motion Guard interno)
+#     → emite NotificationMessage ONVIF en su PullPoint
+#       → FamilyCentinel hace `PullMessages` y recibe IsMotion=true
+#         → activa el TPU para esa cámara durante cooldown_seconds
+#           → al expirar sin nuevo movimiento, el TPU vuelve a dormir
 # -----------------------------------------------------------------------------
-motion_trigger:
+onvif_trigger:
   # true  → sólo procesar cuando hay movimiento (ahorro de recursos)
-  # false → procesar todos los frames siempre (más sencillo, más consumo)
+  # false → procesar todos los frames siempre (pass-through, más consumo)
   enabled: true
-
-  # Topics globales opcionales: cualquier evento en ellos activa TODAS las cámaras.
-  # Útil si tienes un sensor PIR externo o un botón de activación manual.
-  global_topics: []
-  # Ejemplo:
-  # global_topics:
-  #   - "casa/presencia/global"
 
   # Segundos que el TPU permanece activo tras el último evento de movimiento.
   # Aumentar si la persona se mueve lento y hay detecciones que se pierden.
-  # El valor mínimo razonable es: tiempo_de_cruce_de_frame_segundos × 3
   cooldown_seconds: 30.0
 
 

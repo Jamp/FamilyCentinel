@@ -115,39 +115,6 @@ class MqttClient:
     def wait_connected(self, timeout: float = 30.0) -> bool:
         return self._connected.wait(timeout=timeout)
 
-    def subscribe(
-        self,
-        topics: list[str],
-        callback: "Callable[[str, str], None]",
-    ) -> None:
-        """
-        Subscribe to a list of MQTT topics.
-
-        `callback(topic, payload_str)` is called from the paho network thread
-        for every matching message — keep it short and thread-safe.
-        """
-        if not topics:
-            return
-
-        def _on_message(
-            client: mqtt.Client,
-            userdata: object,
-            message: mqtt.MQTTMessage,
-        ) -> None:
-            try:
-                payload = message.payload.decode("utf-8", errors="replace")
-                callback(message.topic, payload)
-            except Exception:
-                log.exception("Error in motion message callback for %s", message.topic)
-
-        self._client.on_message = _on_message
-        for topic in topics:
-            result, _ = self._client.subscribe(topic, qos=1)
-            if result == mqtt.MQTT_ERR_SUCCESS:
-                log.info("Subscribed to motion topic: %s", topic)
-            else:
-                log.warning("Failed to subscribe to topic %s (rc=%d)", topic, result)
-
     def publish_discovery(self) -> None:
         """Publish HA MQTT Discovery config payloads for all three sensors."""
         device_block = {

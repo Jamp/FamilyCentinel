@@ -4,7 +4,8 @@ FLUJO GENERAL:
     1. Cargar configuración (config.yaml + variables de entorno).
     2. Conectar al broker MQTT y publicar MQTT Discovery para Home Assistant.
     3. Abrir todas las cámaras configuradas (producer threads RTSP independientes).
-    4. Si motion_trigger está activo: suscribirse a los topics Thingino.
+    4. Si onvif_trigger está activo: lanzar suscripciones PullPoint por cámara
+       en un asyncio loop dedicado (daemon thread).
     5. Loop principal:
          - Si ninguna cámara tiene movimiento activo → esperar (TPU inactivo).
          - Si hay movimiento → leer frame de la cámara activa → inferencia TPU
@@ -45,8 +46,8 @@ from src.camera import Camera, CameraPool
 from src.config import AppConfig, load_config
 from src.detector import Detector
 from src.motion_gate import MotionGate
-from src.motion_trigger import MotionTrigger
 from src.mqtt_client import MqttClient
+from src.onvif_trigger import OnvifTrigger
 from src.stabilizer import Stabilizer
 
 log = logging.getLogger(__name__)
@@ -129,16 +130,14 @@ class FamilyCentinel:
             for cam_cfg in cfg.cameras
         ]
 
-        # Puerta de movimiento Thingino.
-        self._motion_trigger = MotionTrigger(cfg.motion_trigger)
-        for cam_cfg in cfg.cameras:
-            self._motion_trigger.register_camera(cam_cfg.name, cam_cfg.motion_topic)
+        # Puerta de movimiento ONVIF (PullPoint).
+        self._onvif_trigger = OnvifTrigger(cfg.onvif_trigger, cfg.cameras)
 
         # Pool multi-cámara: distribuye frames activos a la cola de salida.
         self._pool = CameraPool(
             cameras=cameras,
             shutdown_event=self._shutdown,
-            is_camera_active_fn=self._motion_trigger.is_camera_active,
+            is_camera_active_fn=self._onvif_trigger.is_camera_active,
         )
 
         # Inferencia con Edge TPU — un único detector compartido por todas las cámaras.
@@ -169,7 +168,7 @@ class FamilyCentinel:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Conecta MQTT, abre cámaras y entra en el loop principal."""
+        """Conecta MQTT, abre cámaras, lanza ONVIF y entra en el loop principal."""
         self._running = True
         self._mqtt.connect()
 
@@ -178,12 +177,13 @@ class FamilyCentinel:
             log.error("Could not connect to MQTT broker — exiting")
             sys.exit(1)
 
+        self._onvif_trigger.start()
         self._pool.start()
         _write_healthcheck()
         log.info(
-            "FamilyCentinel started — %d camera(s), motion_trigger=%s",
+            "FamilyCentinel started — %d camera(s), onvif_trigger=%s",
             len(self._cfg.cameras),
-            self._cfg.motion_trigger.enabled,
+            self._cfg.onvif_trigger.enabled,
         )
         self._loop()
 
@@ -197,6 +197,7 @@ class FamilyCentinel:
         log.info("Shutdown requested…")
         self._running = False
         self._shutdown.set()
+        self._onvif_trigger.stop()
 
     # ------------------------------------------------------------------
     # Loop principal
@@ -213,7 +214,7 @@ class FamilyCentinel:
             # el pool no produce frames y la cola de salida está vacía.
             # Dormimos para no quemar CPU y seguimos actualizando el heartbeat.
             # ----------------------------------------------------------
-            if not self._motion_trigger.is_active:
+            if not self._onvif_trigger.is_active:
                 self._log_idle_once()
                 self._heartbeat()
                 # Event.wait() permite que SIGTERM nos interrumpa aquí también.
@@ -306,42 +307,23 @@ class FamilyCentinel:
         """Emite un log informativo máx. una vez por minuto mientras está inactivo."""
         now = time.monotonic()
         if now - self._last_idle_log >= _IDLE_LOG_INTERVAL_S:
-            secs = self._motion_trigger.seconds_since_last_global_event
+            secs = self._onvif_trigger.seconds_since_last_global_event
             log.info(
-                "Motion trigger active — TPU idle (%.0fs since last motion event). "
-                "Waiting for Thingino motion events on: %s",
+                "ONVIF trigger active — TPU idle (%.0fs since last motion event)",
                 secs,
-                [c.motion_topic for c in self._cfg.cameras if c.motion_topic],
             )
             self._last_idle_log = now
 
     def _on_mqtt_connect(self) -> None:
         """Llamado por MqttClient al (re)conectarse al broker.
 
-        Re-publica Discovery y estados actuales, y (re)suscribe a los topics
-        de Thingino. La re-suscripción es necesaria tras un reinicio del broker
-        porque usamos clean_session=True.
+        Re-publica Discovery y estados actuales para que HA no muestre
+        "unknown" tras una reconexión del broker (clean_session=True).
         """
-        # Discovery: registra/actualiza los 3 sensores en Home Assistant.
         self._mqtt.publish_discovery()
 
-        # Publicar estado actual para que HA no muestre "unknown" al reconectar.
         for entity, present in self._stabilizer.current_states().items():
             self._mqtt.publish_state(entity, present)
-
-        # Suscribirse a topics de movimiento Thingino si el trigger está activo.
-        if self._cfg.motion_trigger.enabled:
-            topics = self._motion_trigger.all_topics(
-                self._cfg.motion_trigger.global_topics
-            )
-            if topics:
-                self._mqtt.subscribe(topics, self._motion_trigger.on_mqtt_message)
-                log.info("Subscribed to %d Thingino motion topic(s): %s", len(topics), topics)
-            else:
-                log.warning(
-                    "motion_trigger.enabled=true but no topics configured. "
-                    "Add camera motion_topic or global_topics in config.yaml."
-                )
 
     def _shutdown_gracefully(self) -> None:
         """Libera recursos en orden seguro."""
