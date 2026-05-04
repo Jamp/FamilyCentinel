@@ -1,0 +1,58 @@
+# =============================================================================
+# FamilyCentinel — .gitignore
+# CRÍTICO: nunca commitear config.yaml ni .env (contienen credenciales MQTT/RTSP)
+# =============================================================================
+
+# Configuración con credenciales reales
+config*.yaml
+config*.yml
+*.local.yaml
+!config.example.yaml
+
+# Binarios de plataforma y modelos descargados localmente
+libedgetpu*.dylib
+libedgetpu*.so*
+*.pt
+
+# Variables de entorno
+.env
+.env.*
+!.env.example
+
+# Modelos descargados (se obtienen en build de Docker)
+models/*.tflite
+models/*.txt
+!models/.gitkeep
+
+# Calibración y artefactos temporales
+calib.jpg
+calib_*.jpg
+/tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Claude Code (config local de sesión)
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

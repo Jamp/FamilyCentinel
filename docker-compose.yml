@@ -1,0 +1,145 @@
+# =============================================================================
+# FamilyCentinel - Detector de presencia local
+#
+# Uso:
+#   cp .env.example .env  &&  chmod 600 .env
+#   cp config.example.yaml config.yaml  &&  chmod 600 config.yaml
+#   docker compose up -d --build
+#   docker compose logs -f familycentinel
+#   docker compose down
+#
+# Requisitos del host:
+#   - Acelerador Coral USB-C (MA2485) conectado y reconocido por el kernel.
+#   - El usuario que ejecuta `docker compose` debe poder acceder a /dev/bus/usb.
+#   - Archivos `.env` y `config.yaml` con permisos 600.
+# =============================================================================
+
+services:
+  familycentinel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: familycentinel:latest
+    container_name: familycentinel
+
+    # Reinicio automatico ante fallos o reinicio del host.
+    restart: unless-stopped
+
+    # -------------------------------------------------------------------------
+    # Hardening de seguridad
+    # -------------------------------------------------------------------------
+    # Filesystem raiz inmutable: cualquier intento de escritura fuera de los
+    # tmpfs explicitos falla. El proceso solo escribe /tmp/healthcheck.
+    read_only: true
+
+    # Filesystems efimeros donde la app puede escribir.
+    tmpfs:
+      - /tmp:size=16m,mode=1777,nosuid,nodev
+
+    # -------------------------------------------------------------------------
+    # Acceso al Coral Edge TPU USB-C
+    # -------------------------------------------------------------------------
+    # Exponemos el bus USB completo en lugar de un dispositivo concreto porque,
+    # tras la primera inferencia, el Coral re-enumera y cambia su path. Pasar
+    # solo `/dev/bus/usb/XXX/YYY` causaria que el dispositivo "desaparezca".
+    #
+    # NOTA DE SEGURIDAD: exponer /dev/bus/usb da al contenedor acceso a TODOS
+    # los dispositivos USB del host. En este escenario domestico es aceptable;
+    # si hay otros USB sensibles (yubikey, smartcard, etc.) considerar usar
+    # reglas udev para filtrar solo el VID:PID 18d1:9302 (Coral) o conectarlo
+    # a un hub USB dedicado.
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+
+    # No usamos `privileged: true`; concedemos solo las capacidades necesarias.
+    privileged: false
+
+    # Drop ALL capabilities por defecto y vuelve a anadir solo lo imprescindible.
+    cap_drop:
+      - ALL
+    cap_add:
+      # SYS_RAWIO: requerido por libedgetpu para hacer ioctl() de bajo nivel
+      # contra el dispositivo USB del Coral (transferencias bulk USB).
+      - SYS_RAWIO
+
+    security_opt:
+      # Impide que el proceso (o sus hijos) gane privilegios via setuid.
+      - "no-new-privileges:true"
+      # AppArmor en modo `unconfined` es necesario en distros como Ubuntu /
+      # Debian donde el perfil por defecto de Docker bloquea las llamadas
+      # ioctl que `libedgetpu` realiza contra el endpoint USB del MA2485.
+      # Sin esto el TPU enumera pero falla al cargar el modelo con EPERM.
+      #
+      # MITIGACION: el contenedor corre como uid 1000 (no root), con read_only
+      # rootfs, capabilities reducidas y no-new-privileges, lo que limita el
+      # impacto de tener AppArmor unconfined. Si tu kernel/distro permite un
+      # perfil AppArmor custom, sustituir esta linea por uno propio.
+      - "apparmor:unconfined"
+
+    # Limites de recursos para evitar denial-of-service por bug en la app.
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+
+    # -------------------------------------------------------------------------
+    # Configuracion
+    # -------------------------------------------------------------------------
+    volumes:
+      # Montaje de SOLO LECTURA del archivo de configuracion. La aplicacion
+      # busca por defecto en `/app/config/config.yaml`.
+      - ./config.yaml:/app/config/config.yaml:ro
+
+    # -------------------------------------------------------------------------
+    # Puerto de depuración (descomentar para activar el stream MJPEG)
+    #
+    # Una vez descomentado, ejecutar el servidor de debug con:
+    #   docker compose exec familycentinel python tools/debug_stream.py \
+    #       --config /app/config/config.yaml --port 8080
+    # Y abrir en el navegador:
+    #   http://<IP_HOST>:8080
+    #
+    # SEGURIDAD: no exponer este puerto a Internet. Es sólo para red local.
+    # -------------------------------------------------------------------------
+    # ports:
+    #   - "8080:8080"
+
+    # -------------------------------------------------------------------------
+    # Variables de entorno
+    #
+    # Las credenciales se cargan desde un archivo .env (chmod 600) que NO se
+    # commitea al repositorio. Ver `.env.example` para la plantilla.
+    # -------------------------------------------------------------------------
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # TZ por defecto si no esta en .env.
+      TZ: ${TZ:-Europe/Madrid}
+
+    # -------------------------------------------------------------------------
+    # Red
+    # -------------------------------------------------------------------------
+    # Usamos la red bridge por defecto en lugar de `network_mode: host` porque:
+    #   1. El stream RTSP es saliente.
+    #   2. MQTT tambien es saliente hacia el broker.
+    #   3. No exponemos puertos entrantes al host.
+    #   4. `host` mode rompe la portabilidad y reduce el aislamiento.
+    networks:
+      - familycentinel-net
+
+    # -------------------------------------------------------------------------
+    # Logging - limitar tamano para no llenar el disco en despliegues 24/7
+    # -------------------------------------------------------------------------
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  familycentinel-net:
+    driver: bridge

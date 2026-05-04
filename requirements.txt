@@ -1,0 +1,31 @@
+# =============================================================================
+# FamilyCentinel - Python dependencies
+#
+# SEGURIDAD:
+#   - Versiones minimas elegidas para evitar CVEs conocidos a fecha 2026-05.
+#   - Usamos opencv-python-headless (sin GUI) para reducir la superficie de
+#     ataque y el tamano de imagen.
+#   - paho-mqtt 2.x esta activamente mantenido (1.x fue deprecated).
+#   - PyYAML >=6.0.1 corrige CVE-2020-14343 (yaml.load arbitrary code execution
+#     en versiones antiguas; nosotros usamos yaml.safe_load igualmente).
+#   - Auditar periodicamente con: pip install pip-audit && pip-audit -r requirements.txt
+# =============================================================================
+
+# Core inference runtime - ai-edge-litert es el sucesor de tflite-runtime.
+ai-edge-litert>=1.0.1
+
+# Fallback: tflite-runtime construido para la arquitectura objetivo.
+# tflite-runtime==2.14.0
+
+# Captura de video sin dependencias de GUI.
+# >=4.9.0.80 incluye correcciones a CVE-2023-2617 / CVE-2024-32462.
+opencv-python-headless>=4.9.0.80,<5.0.0
+
+# Cliente MQTT - 2.x usa CallbackAPIVersion enum.
+paho-mqtt>=2.1.0,<3.0.0
+
+# Carga de configuracion. >=6.0.1 mitiga CVE-2020-14343.
+PyYAML>=6.0.1,<7.0.0
+
+# Operaciones numericas (bbox arithmetic).
+numpy>=1.26.0,<3.0.0

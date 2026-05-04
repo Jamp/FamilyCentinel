@@ -1,0 +1,227 @@
+# =============================================================================
+# FamilyCentinel — Configuración de ejemplo
+# Copia este archivo como config.yaml y ajusta los valores a tu entorno.
+#
+# SEGURIDAD (leer antes de usar):
+#   - NUNCA commitees config.yaml con credenciales reales. Ya está en .gitignore.
+#   - Para credenciales (RTSP, MQTT) usa preferentemente variables de entorno
+#     inyectadas desde .env (chmod 600). Ver .env.example.
+#   - La URL RTSP incluye usuario:contraseña en claro. Usa un usuario de
+#     SOLO LECTURA con contraseña aleatoria ≥16 caracteres en la cámara.
+#   - El usuario que ejecute el contenedor debe estar en el grupo `plugdev`
+#     para acceder al Coral USB-C sin --privileged.
+#   - En producción, considera habilitar TLS en el broker MQTT (sección `mqtt.tls`).
+#
+# INICIO RÁPIDO:
+#   cp config.example.yaml config.yaml && chmod 600 config.yaml
+#   cp .env.example .env && chmod 600 .env  # editar credenciales
+#   docker compose up --build -d
+#   docker compose logs -f
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# CÁMARAS (multi-cámara)
+#
+# Añadir una entrada por cámara. Cada cámara:
+#   - Corre en su propio producer thread RTSP
+#   - Puede tener su propio topic de movimiento Thingino
+#   - Comparte el único Coral Edge TPU (procesamiento secuencial)
+#
+# COMPATIBILIDAD LEGACY: si tienes una sola cámara y usabas `camera:` (singular)
+# en versiones anteriores, sigue funcionando. Puedes migrar a `cameras:` cuando
+# quieras añadir más cámaras.
+# -----------------------------------------------------------------------------
+cameras:
+  # ---- Cámara 1: salón -------------------------------------------------------
+  - name: salon               # Identificador único (aparece en logs)
+    type: rtsp                # "rtsp" (IP) o "usb" (webcam local)
+
+    # URL RTSP con credenciales. Formato: rtsp://USER:PASS@IP:PUERTO/ruta
+    # SEGURIDAD: crea un usuario de solo-lectura en la cámara para esto.
+    # Ejemplos de paths por fabricante:
+    #   Hikvision:  rtsp://USER:PASS@192.168.1.100:554/Streaming/Channels/101
+    #   Dahua:      rtsp://USER:PASS@192.168.1.100:554/cam/realmonitor?channel=1&subtype=0
+    #   Reolink:    rtsp://USER:PASS@192.168.1.100:554/h264Preview_01_main
+    #   Thingino:   rtsp://USER:PASS@192.168.1.100:554/ch0  (verificar en web UI)
+    url: "rtsp://CAMBIAME_USER:CAMBIAME_PASSWORD@192.168.1.101:554/ch0"
+
+    target_fps: 10            # FPS objetivo. 10 fps es suficiente para presencia.
+    width: 640                # Resolución solicitada (puede ser ignorada por el stream)
+    height: 480
+    reconnect_delay_s: 5.0    # Segundos entre reintentos de conexión
+
+    # Topic MQTT de Thingino para el trigger de movimiento de ESTA cámara.
+    # Dejar vacío si no usas trigger de movimiento con esta cámara.
+    # Configurar en Thingino: Tools → Motion Guard → Send to MQTT
+    motion_topic: "thingino/salon"
+
+  # ---- Cámara 2: entrada -----------------------------------------------------
+  - name: entrada
+    type: rtsp
+    url: "rtsp://CAMBIAME_USER:CAMBIAME_PASSWORD@192.168.1.102:554/ch0"
+    target_fps: 10
+    width: 640
+    height: 480
+    reconnect_delay_s: 5.0
+    motion_topic: "thingino/entrada"
+
+  # ---- Plantilla para más cámaras (descomentar y rellenar) -------------------
+  # - name: cocina
+  #   type: rtsp
+  #   url: "rtsp://USER:PASS@192.168.1.103:554/ch0"
+  #   target_fps: 10
+  #   width: 640
+  #   height: 480
+  #   reconnect_delay_s: 5.0
+  #   motion_topic: "thingino/cocina"
+
+  # ---- Cámara USB (fallback sin red) -----------------------------------------
+  # - name: usb_local
+  #   type: usb
+  #   device_index: 0          # /dev/video0
+  #   target_fps: 10
+  #   width: 640
+  #   height: 480
+  #   reconnect_delay_s: 3.0
+  #   motion_topic: ""          # Sin trigger de movimiento para USB
+
+
+# -----------------------------------------------------------------------------
+# DETECCIÓN
+# Parámetros del modelo SSD MobileNet v2 COCO compilado para Edge TPU.
+# -----------------------------------------------------------------------------
+detection:
+  # Confianza mínima [0.0–1.0]. Subir si hay falsos positivos; bajar si pierde detecciones.
+  min_confidence: 0.5
+
+  # Clases del modelo COCO a procesar. No cambiar salvo que uses otro modelo.
+  # "dog" es la clase 16 del COCO 0-indexed.
+  classes:
+    - person
+    - dog
+
+
+# -----------------------------------------------------------------------------
+# ESTABILIZACIÓN TEMPORAL
+#
+# Evita que los sensores de Home Assistant parpadeen por detecciones esporádicas.
+# Una entidad pasa a "presente" tras N detecciones consecutivas y a "ausente"
+# tras M frames sin detectarla.
+#
+# Con 10 fps y los valores por defecto:
+#   frames_to_activate=3   → presencia confirmada en ~0.3 segundos
+#   frames_to_deactivate=30 → ausencia confirmada en ~3 segundos
+# -----------------------------------------------------------------------------
+stabilization:
+  frames_to_activate: 3
+  frames_to_deactivate: 30
+  # Segundos mínimos desde la última detección para marcar una entidad como ausente.
+  # Protege contra falsos ausentes cuando alguien está presente pero el modelo
+  # no lo detecta temporalmente (durmiendo bajo una cobija, agachado, quieto).
+  #
+  # Cómo funciona:
+  #   - Persona detectada → PRESENTE
+  #   - Persona deja de detectarse (duerme, se cubre) → el contador de frames
+  #     sin detección llega a frames_to_deactivate (3s)... pero NO marca ausente
+  #     hasta que pasen min_presence_seconds desde la última detección positiva.
+  #   - Si la persona se mueve aunque sea un poco → detección positiva → reinicia
+  #     el timer de min_presence_seconds (una persona dormida se mueve cada ~5min)
+  #
+  # Valores sugeridos:
+  #   0     = desactivado (riesgo de falsos ausentes con personas quietas)
+  #   300   = 5 minutos (hogares sin siesta larga)
+  #   600   = 10 minutos (recomendado, equilibrio entre precisión y seguridad)
+  #   1800  = 30 minutos (casas donde se duerme siesta frente a cámaras)
+  min_presence_seconds: 600
+
+
+# -----------------------------------------------------------------------------
+# DISPARO POR MOVIMIENTO (Thingino)
+#
+# Cuando está activo, el Edge TPU sólo procesa frames mientras alguna de las
+# cámaras haya detectado movimiento recientemente. Esto puede reducir el
+# consumo de CPU/TPU hasta un 90% en hogares con pocas horas de actividad.
+#
+# CONFIGURACIÓN EN THINGINO (una vez por cámara, 5 minutos):
+#   1. Abre http://<IP_CAMARA> (web UI de Thingino)
+#   2. Ve a: Tools → Motion Guard
+#   3. Activa "Motion Guard"
+#   4. Marca la casilla "Send to MQTT"
+#   5. Configura:
+#        Host: <IP del broker MQTT de Home Assistant>
+#        Port: 1883
+#        Usuario/contraseña: los mismos que FamilyCentinel
+#        Topic: thingino/<nombre_camara>  (p.ej. thingino/salon)
+#   6. Copia ese topic en `cameras[n].motion_topic` más arriba
+#
+# DIAGRAMA DE FLUJO:
+#   Thingino detecta movimiento
+#     → publica mensaje a thingino/<camara>
+#       → FamilyCentinel activa el TPU para esa cámara durante cooldown_seconds
+#         → al expirar el cooldown sin nuevo movimiento, el TPU vuelve a dormir
+# -----------------------------------------------------------------------------
+motion_trigger:
+  # true  → sólo procesar cuando hay movimiento (ahorro de recursos)
+  # false → procesar todos los frames siempre (más sencillo, más consumo)
+  enabled: true
+
+  # Topics globales opcionales: cualquier evento en ellos activa TODAS las cámaras.
+  # Útil si tienes un sensor PIR externo o un botón de activación manual.
+  global_topics: []
+  # Ejemplo:
+  # global_topics:
+  #   - "casa/presencia/global"
+
+  # Segundos que el TPU permanece activo tras el último evento de movimiento.
+  # Aumentar si la persona se mueve lento y hay detecciones que se pierden.
+  # El valor mínimo razonable es: tiempo_de_cruce_de_frame_segundos × 3
+  cooldown_seconds: 30.0
+
+
+# -----------------------------------------------------------------------------
+# MQTT
+#
+# Credenciales y configuración del broker MQTT (normalmente Mosquitto en HA).
+#
+# RECOMENDACIÓN: dejar username/password en null y pasarlos via variables de
+# entorno desde un archivo .env (chmod 600). Variables disponibles:
+#   MQTT_HOST, MQTT_PORT, MQTT_USERNAME, MQTT_PASSWORD, MQTT_DISCOVERY_PREFIX
+#
+# Ver .env.example para la plantilla.
+# -----------------------------------------------------------------------------
+mqtt:
+  host: "192.168.1.10"      # IP o hostname del broker MQTT (normalmente HA)
+  port: 1883                 # 1883 = sin TLS, 8883 = con TLS
+
+  # Dejar null aquí y usar variables de entorno MQTT_USERNAME / MQTT_PASSWORD
+  username: null
+  password: null
+
+  # TLS: activar si el broker está en otra VLAN o si la red no es completamente
+  # de confianza. Para la mayoría de hogares con broker local no es necesario.
+  tls:
+    enabled: false
+    ca_certs: null            # Ruta al CA bundle (montar como volumen ro en Docker)
+    insecure: false           # true = no verificar cert (sólo para pruebas locales)
+
+  # Prefijo de MQTT Discovery. Cambiar sólo si se modificó en HA.
+  discovery_prefix: "homeassistant"
+
+  # Nombre del dispositivo en Home Assistant
+  device_name: "FamilyCentinel"
+
+  # ID único del dispositivo (usado en topics MQTT y en HA).
+  # NO cambiar una vez en producción — HA lo usa para identificar el dispositivo.
+  device_id: "familycentinel"
+
+  keepalive: 60
+
+
+# -----------------------------------------------------------------------------
+# RUTAS DE MODELOS
+# Normalmente no es necesario cambiar estos valores si usas el Dockerfile.
+# Los modelos se descargan automáticamente durante `docker compose build`.
+# -----------------------------------------------------------------------------
+model_path: "/app/models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite"
+labels_path: "/app/models/coco_labels.txt"

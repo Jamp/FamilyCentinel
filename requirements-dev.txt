@@ -1,0 +1,36 @@
+# =============================================================================
+# Dependencias para desarrollo / testing local (Mac o Linux sin Docker)
+#
+# Diferencias respecto a requirements.txt (producción):
+#   - opencv-python en lugar de opencv-python-headless
+#     (mismas funciones, pero permite abrir ventanas GUI en local)
+#   - Sin restricción de upper bound tan estricta
+#
+# Instalación:
+#   python3.11 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements-dev.txt
+# =============================================================================
+
+# Inferencia TFLite — tiene wheels nativas para macOS ARM64 (Apple Silicon)
+# y macOS x86_64 (Intel). No necesita Coral para correr en CPU.
+ai-edge-litert>=2.1.0
+
+# ONNX Runtime — usa Core ML Execution Provider en Apple Silicon (ANE/GPU).
+# En macOS ARM64 onnxruntime>=1.18 incluye CoreMLExecutionProvider por defecto.
+onnxruntime>=1.18.0
+
+# Conversión TFLite → ONNX (necesaria para generar el .onnx la primera vez)
+tf2onnx>=1.16.0
+
+# Captura de vídeo y dibujado de bboxes
+opencv-python>=4.9.0.80
+
+# MQTT
+paho-mqtt>=2.1.0,<3.0.0
+
+# Configuración
+PyYAML>=6.0.1
+
+# Numérico
+numpy>=1.26.0,<3.0.0
