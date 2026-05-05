@@ -48,6 +48,7 @@ from src.camera import Camera
 from src.config import AppConfig, load_config
 from src.detector import Detector
 from src.motion_gate import MotionGate
+from src.onvif_trigger import OnvifTrigger
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -112,7 +113,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     img  {{ display: block; max-width: 100%; }}
     .legend {{ font-size: 0.75em; margin-top: 12px; color: #888; }}
     .legend span {{ margin-right: 12px; }}
-    .person {{ color: #0c8; }} .dog {{ color: #68f; }}
+    .person {{ color: #0c8; }} .dog {{ color: #68f; }} .quiet {{ color: #cc0; }}
   </style>
 </head>
 <body>
@@ -121,8 +122,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     {camera_tiles}
   </div>
   <div class="legend">
-    <span class="person">■ Persona</span>
-    <span class="dog">■ Perro</span>
+    <span class="person">■ Persona (activa)</span>
+    <span class="dog">■ Perro (activo)</span>
+    <span class="quiet">■ Quieto (modelo ve, producción filtra)</span>
   </div>
   <script>
     document.querySelectorAll('img[data-cam]').forEach(img => {{
@@ -218,55 +220,59 @@ def _annotate_detections(
         if cfg.detection.is_excluded(cam_name, det.bbox):
             continue
 
-        has_mov = _motion_gate.has_motion(cam_name, frame, det.bbox)
-        if not has_mov:
-            ymin, xmin, ymax, xmax = det.bbox
-            x1, y1 = int(xmin * w), int(ymin * h)
-            x2, y2 = int(xmax * w), int(ymax * h)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (70, 70, 70), 1)
-            cv2.putText(frame, f"sin movimiento {det.score:.0%}",
-                        (x1+2, y1+14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (70,70,70), 1)
-            continue
-
         if det.label == "person":
             label = "person"
+            display = "person"
         elif det.label in ("dog", "cat"):
             label = "dog"
-            if det.label == "cat":
-                det = type(det)(det.bbox, det.score, "cat")
+            display = det.label
         else:
             continue
 
-        entities.add(label)
-        color = _COLORS.get(label, _COLORS["unknown"])
+        has_mov = _motion_gate.has_motion(cam_name, frame, det.bbox)
 
         ymin, xmin, ymax, xmax = det.bbox
         x1, y1 = int(xmin * w), int(ymin * h)
         x2, y2 = int(xmax * w), int(ymax * h)
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        if has_mov:
+            # Detección activa: color sólido — produciría inferencia en producción
+            color = _COLORS.get(label, _COLORS["unknown"])
+            thickness = 2
+            entities.add(label)
+            stats_lines.append(f"{label}({det.score:.0%})")
+        else:
+            # Detección sin movimiento: bbox punteado amarillo — modelo ve la entidad
+            # pero el motion_gate la filtraría en producción (persona quieta)
+            color = (0, 200, 200)   # amarillo
+            thickness = 1
 
-        text = f"{label} {det.score:.0%}"
-        if det.label == "cat":
-            text += "  (cat)"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+        suffix = "" if has_mov else " ~quieto"
+        text = f"{display} {det.score:.0%}{suffix}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
         cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), _TEXT_BG, -1)
         cv2.putText(
             frame, text, (x1 + 2, y1 - 4),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA,
         )
-
-        stats_lines.append(f"{label}({det.score:.0%})")
 
     return entities, " | ".join(stats_lines) or "—"
 
 
-def _draw_overlay(frame: np.ndarray, camera_name: str, fps: float, stats: str) -> None:
-    """Dibuja barra de estado: timestamp, nombre de cámara, FPS y stats."""
+def _draw_overlay(
+    frame: np.ndarray,
+    camera_name: str,
+    fps: float,
+    stats: str,
+    motion_active: bool,
+) -> None:
+    """Dibuja barra de estado e indicador de movimiento ONVIF."""
     ts = time.strftime("%H:%M:%S")
     lines = [
         f"{camera_name}  {ts}  {fps:.1f}fps",
-        stats,
+        stats if stats != "—" else "sin detecciones",
     ]
     for i, line in enumerate(lines):
         y = 18 + i * 18
@@ -274,6 +280,25 @@ def _draw_overlay(frame: np.ndarray, camera_name: str, fps: float, stats: str) -
             frame, line, (4, y),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA,
         )
+
+    # Indicador ONVIF (esquina superior derecha)
+    h, w = frame.shape[:2]
+    label     = "ONVIF: MOVIMIENTO"   if motion_active else "ONVIF: sin movimiento"
+    color     = (0, 60, 255)          if motion_active else (80, 80, 80)
+    dot_color = (0, 80, 255)          if motion_active else (60, 60, 60)
+
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    x = w - tw - 22
+    y = 18
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x - 6, y - th - 4), (w - 4, y + 4), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.circle(frame, (x - 10, y - th // 2), 5, dot_color, -1, cv2.LINE_AA)
+    cv2.putText(frame, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    # Borde rojo en todo el frame cuando el TPU estaría activo
+    if motion_active:
+        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 60, 255), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +311,7 @@ def _camera_thread(
     detector_lock: threading.Lock,
     cfg: AppConfig,
     target_fps: int,
+    onvif_trigger: OnvifTrigger,
 ) -> None:
     cam.open()
     frame_interval = 1.0 / max(target_fps, 1)
@@ -321,7 +347,8 @@ def _camera_thread(
                     cfg.detection.exclusion_zones.get(cam.name, []),
                 )
                 entities, stats = _annotate_detections(annotated, detections, cfg, cam.name)
-                _draw_overlay(annotated, cam.name, fps_display, stats)
+                motion_active = onvif_trigger.is_camera_active(cam.name)
+                _draw_overlay(annotated, cam.name, fps_display, stats, motion_active)
                 _state.update(cam.name, annotated, stats)
                 _motion_gate.update(cam.name, frame)
             except Exception as exc:
@@ -351,6 +378,9 @@ def main() -> None:
 
     cfg = load_config(args.config)
 
+    onvif_trigger = OnvifTrigger(cfg.onvif_trigger, cfg.cameras)
+    onvif_trigger.start()
+
     log.info("Loading detector (use_tpu=%s)…", args.use_tpu)
     detector = Detector(
         model_path=cfg.model_path,
@@ -368,7 +398,7 @@ def main() -> None:
         cam = Camera(cam_cfg, shutdown_event=shutdown)
         t = threading.Thread(
             target=_camera_thread,
-            args=(cam, detector, detector_lock, cfg, args.fps),
+            args=(cam, detector, detector_lock, cfg, args.fps, onvif_trigger),
             name=f"debug-{cam_cfg.name}",
             daemon=True,
         )

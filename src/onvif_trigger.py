@@ -115,6 +115,22 @@ class OnvifTrigger:
         with self._lock:
             return (now - self._last_event[camera_name]) < self._cfg.cooldown_seconds
 
+    def notify_detection(self, camera_name: str) -> None:
+        """Extiende la ventana activa cuando el TPU detecta una entidad.
+
+        Llamar cada vez que el modelo encuentra person o dog en un frame.
+        Resetea el cooldown de esa cámara igual que un evento ONVIF, de modo
+        que el TPU permanece activo mientras haya detecciones — incluso si
+        ONVIF dejó de emitir eventos (persona quieta).
+        El TPU entrará en reposo solo cuando pasen `cooldown_seconds` sin
+        ninguna detección Y sin ningún evento ONVIF.
+        """
+        if not self._cfg.enabled:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._last_event[camera_name] = now
+
     @property
     def seconds_since_last_global_event(self) -> float:
         """Segundos desde el evento más reciente en cualquier cámara."""

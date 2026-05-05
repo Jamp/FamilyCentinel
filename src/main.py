@@ -290,6 +290,13 @@ class FamilyCentinel:
             entities.add(entity)
 
         self._motion_gate.update(camera_name, frame)
+
+        # Si el TPU detectó algo, extender la ventana activa de esta cámara.
+        # Así el sistema no entra en reposo mientras haya detecciones, aunque
+        # ONVIF haya dejado de emitir eventos (entidad quieta pero presente).
+        if entities:
+            self._onvif_trigger.notify_detection(camera_name)
+
         return entities
 
     # ------------------------------------------------------------------
