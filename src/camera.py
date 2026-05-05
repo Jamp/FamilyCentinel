@@ -25,7 +25,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from src.config import CameraConfig
+from src.config import CameraConfig, mask_rtsp_url
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,11 @@ class Camera:
         # Cola de un solo slot: descarta frames viejos automáticamente.
         self._frame_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=1)
         self._thread: Optional[threading.Thread] = None
+        # Estado de actividad propagado desde el ONVIF trigger. Cuando está
+        # apagado el _capture_loop usa cap.grab() (~10x más barato que read())
+        # para mantener el stream sincronizado sin decodificar H.264.
+        self._active_event: threading.Event = threading.Event()
+        self._active_event.set()
 
     @property
     def name(self) -> str:
@@ -98,6 +103,18 @@ class Camera:
             self._thread.join(timeout=5.0)
             self._thread = None
 
+    def set_active(self, active: bool) -> None:
+        """Activa o desactiva la decodificación de frames.
+
+        Cuando está inactiva, el producer mantiene el socket RTSP vivo con
+        cap.grab() pero no decodifica H.264 — evita 30-40% de CPU en hosts
+        modestos cuando el ONVIF trigger reporta que la cámara está quieta.
+        """
+        if active:
+            self._active_event.set()
+        else:
+            self._active_event.clear()
+
     # ------------------------------------------------------------------
     # Producer thread
     # ------------------------------------------------------------------
@@ -116,6 +133,13 @@ class Camera:
                 cap = self._connect_with_retry()
                 if cap is None:
                     break  # shutdown señalizado durante el reintento
+                continue
+
+            if not self._active_event.is_set():
+                # Cámara inactiva: mantener sync RTSP con grab() (sin decodificar)
+                # para que al reactivarse no haya frames acumulados obsoletos.
+                cap.grab()
+                self._shutdown.wait(timeout=0.05)
                 continue
 
             ret, frame = cap.read()
@@ -169,12 +193,7 @@ class Camera:
     def _source_description(self) -> str:
         """Devuelve descripción de la fuente con credenciales enmascaradas."""
         if self._cfg.type == "rtsp":
-            url = self._cfg.url
-            if "@" in url:
-                prefix = url.split("://")[0] + "://"
-                rest = url.split("@", 1)[1]
-                url = f"{prefix}***@{rest}"
-            return f"RTSP {url}"
+            return f"RTSP {mask_rtsp_url(self._cfg.url)}"
         return f"USB /dev/video{self._cfg.device_index}"
 
     def _create_capture(self) -> Optional[cv2.VideoCapture]:
@@ -258,7 +277,11 @@ class CameraPool:
             any_active = False
 
             for cam in self._cameras:
-                if not self._is_active(cam.name):
+                is_active = self._is_active(cam.name)
+                # Propagar estado al producer thread para que decida entre
+                # cap.read() (decodifica) o cap.grab() (sólo sincroniza).
+                cam.set_active(is_active)
+                if not is_active:
                     continue  # puerta de movimiento cerrada para esta cámara
 
                 any_active = True

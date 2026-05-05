@@ -31,10 +31,10 @@ DESACTIVACIÓN:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
-from collections import defaultdict
 from typing import Optional
 
 from lxml import etree
@@ -83,7 +83,7 @@ class OnvifTrigger:
         self._cameras = cameras
 
         self._lock = threading.Lock()
-        self._last_event: dict[str, float] = defaultdict(lambda: _NEVER)
+        self._last_event: dict[str, float] = {}
         self._total_events: int = 0
 
         # asyncio loop ejecutado en thread propio. Se materializa en `start()`.
@@ -113,7 +113,7 @@ class OnvifTrigger:
             return True
         now = time.monotonic()
         with self._lock:
-            return (now - self._last_event[camera_name]) < self._cfg.cooldown_seconds
+            return (now - self._last_event.get(camera_name, _NEVER)) < self._cfg.cooldown_seconds
 
     def notify_detection(self, camera_name: str) -> None:
         """Extiende la ventana activa cuando el TPU detecta una entidad.
@@ -188,6 +188,16 @@ class OnvifTrigger:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
+        # ThreadPoolExecutor dedicado: cada cámara bloquea un worker durante
+        # hasta PT30S en PullMessages. Con el pool por defecto (cpu+4=8 workers)
+        # y 6 cámaras activas quedan solo 2 libres para reconexiones simultáneas.
+        n_cams = len([c for c in self._cameras if c.onvif.host])
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=n_cams * 2 + 2,
+            thread_name_prefix="onvif-pool",
+        )
+        self._loop.set_default_executor(executor)
+
         try:
             tasks = [
                 self._loop.create_task(
@@ -261,19 +271,26 @@ class OnvifTrigger:
         service = cam.create_pullpoint_service()
         log.info("ONVIF[%s] PullPoint subscription created on %s:%d", camera_name, host, port)
 
-        while not self._stop_event.is_set():
-            messages = await asyncio.to_thread(
-                service.PullMessages,
-                {"Timeout": _PULL_TIMEOUT, "MessageLimit": _PULL_MESSAGE_LIMIT},
-            )
-            notifications = getattr(messages, "NotificationMessage", None) or []
-
-            if not notifications:
-                log.debug("ONVIF[%s] empty PullMessages response", camera_name)
-                continue
-
-            for msg in notifications:
-                self._handle_notification(camera_name, msg)
+        try:
+            while not self._stop_event.is_set():
+                messages = await asyncio.to_thread(
+                    service.PullMessages,
+                    {"Timeout": _PULL_TIMEOUT, "MessageLimit": _PULL_MESSAGE_LIMIT},
+                )
+                notifications = getattr(messages, "NotificationMessage", None) or []
+                if not notifications:
+                    log.debug("ONVIF[%s] empty PullMessages response", camera_name)
+                    continue
+                for msg in notifications:
+                    self._handle_notification(camera_name, msg)
+        finally:
+            # Informar a la cámara que ya no somos suscriptores activos.
+            # Evita que la cámara acumule suscripciones colgadas al reiniciar.
+            try:
+                await asyncio.to_thread(service.Unsubscribe)
+                log.debug("ONVIF[%s] suscripción cancelada correctamente", camera_name)
+            except Exception:
+                pass
 
     def _handle_notification(self, camera_name: str, msg: object) -> None:
         """Extrae IsMotion del NotificationMessage y actualiza el estado.

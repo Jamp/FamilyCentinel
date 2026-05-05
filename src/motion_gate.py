@@ -50,19 +50,24 @@ class MotionGate:
     def has_motion(
         self,
         camera_name: str,
-        curr_frame: np.ndarray,
+        curr_gray: np.ndarray,
         bbox: tuple[float, float, float, float],
     ) -> bool:
         """True si hay movimiento de píxeles en el área del bbox.
 
         Devuelve True cuando no hay frame de referencia (primer frame tras
         arranque) para no bloquear detecciones legítimas al inicio.
+
+        El frame se recibe ya en escala de grises porque el caller convierte
+        BGR→GRAY una sola vez por frame y reutiliza el resultado para todas
+        las detecciones — convertir N+1 veces costaba más que la propia
+        comparación de píxeles.
         """
         prev_gray = self._prev_gray.get(camera_name)
         if prev_gray is None:
             return True
 
-        h, w = curr_frame.shape[:2]
+        h, w = curr_gray.shape[:2]
         ymin, xmin, ymax, xmax = bbox
         y1, y2 = max(0, int(ymin * h)), min(h, int(ymax * h))
         x1, x2 = max(0, int(xmin * w)), min(w, int(xmax * w))
@@ -70,7 +75,6 @@ class MotionGate:
         if (y2 - y1) < 4 or (x2 - x1) < 4:
             return True  # bbox demasiado pequeño para medir movimiento
 
-        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
         diff = cv2.absdiff(curr_gray[y1:y2, x1:x2], prev_gray[y1:y2, x1:x2])
         moving_px = int(np.sum(diff > self._pixel_threshold))
         total_px  = diff.size
@@ -82,6 +86,6 @@ class MotionGate:
         )
         return fraction >= self._motion_fraction
 
-    def update(self, camera_name: str, frame: np.ndarray) -> None:
-        """Guardar el frame actual como referencia para el siguiente ciclo."""
-        self._prev_gray[camera_name] = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def update(self, camera_name: str, frame_gray: np.ndarray) -> None:
+        """Guardar el frame gris actual como referencia para el siguiente ciclo."""
+        self._prev_gray[camera_name] = frame_gray

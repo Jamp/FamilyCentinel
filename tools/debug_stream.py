@@ -30,7 +30,6 @@ el Edge TPU (sólo si el servicio principal está parado).
 from __future__ import annotations
 
 import argparse
-import io
 import logging
 import sys
 import threading
@@ -144,7 +143,6 @@ _CAM_TILE = """
     </div>
 """
 
-_BOUNDARY = b"--frameboundary"
 
 
 class DebugHandler(BaseHTTPRequestHandler):
@@ -211,6 +209,7 @@ def _annotate_detections(
     detections,
     cfg: AppConfig,
     cam_name: str = "",
+    curr_gray: Optional[np.ndarray] = None,
 ) -> tuple[set[str], str]:
     h, w = frame.shape[:2]
     entities: set[str] = set()
@@ -229,7 +228,7 @@ def _annotate_detections(
         else:
             continue
 
-        has_mov = _motion_gate.has_motion(cam_name, frame, det.bbox)
+        has_mov = _motion_gate.has_motion(cam_name, curr_gray, det.bbox)
 
         ymin, xmin, ymax, xmax = det.bbox
         x1, y1 = int(xmin * w), int(ymin * h)
@@ -346,11 +345,16 @@ def _camera_thread(
                     annotated,
                     cfg.detection.exclusion_zones.get(cam.name, []),
                 )
-                entities, stats = _annotate_detections(annotated, detections, cfg, cam.name)
+                # Conversión BGR->GRAY una sola vez por frame, reutilizada
+                # para has_motion (N llamadas) y update (1 llamada).
+                curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                entities, stats = _annotate_detections(
+                    annotated, detections, cfg, cam.name, curr_gray=curr_gray,
+                )
                 motion_active = onvif_trigger.is_camera_active(cam.name)
                 _draw_overlay(annotated, cam.name, fps_display, stats, motion_active)
                 _state.update(cam.name, annotated, stats)
-                _motion_gate.update(cam.name, frame)
+                _motion_gate.update(cam.name, curr_gray)
             except Exception as exc:
                 log.warning("[%s] Inference error: %s", cam.name, exc)
 

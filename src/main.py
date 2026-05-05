@@ -35,12 +35,15 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import queue
 import re
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
+
+import cv2
 
 from src.camera import Camera, CameraPool
 from src.config import AppConfig, load_config
@@ -224,8 +227,7 @@ class FamilyCentinel:
             # Leer el frame más reciente de cualquier cámara activa.
             try:
                 camera_name, frame = self._pool.output_queue.get(timeout=1.0)
-            except Exception:
-                # queue.Empty: ningún frame disponible — volver a comprobar.
+            except queue.Empty:
                 continue
 
             try:
@@ -265,6 +267,10 @@ class FamilyCentinel:
         entities: set[str] = set()
         target_classes = set(self._cfg.detection.classes)
         current_states = self._stabilizer.current_states()
+        # Conversión BGR->GRAY una sola vez por frame y reutilizada para
+        # has_motion (N llamadas) y update (1 llamada) — antes se convertía
+        # N+1 veces por frame.
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         for det in detections:
             if det.label not in target_classes:
@@ -283,13 +289,13 @@ class FamilyCentinel:
             # Si ya está marcada como presente (persona parada quieta), se omite
             # el filtro para no interrumpir presencias confirmadas.
             if not current_states.get(entity, False):
-                if not self._motion_gate.has_motion(camera_name, frame, det.bbox):
+                if not self._motion_gate.has_motion(camera_name, curr_gray, det.bbox):
                     log.debug("[%s] %s ignorado — sin movimiento en bbox", camera_name, entity)
                     continue
 
             entities.add(entity)
 
-        self._motion_gate.update(camera_name, frame)
+        self._motion_gate.update(camera_name, curr_gray)
 
         # Si el TPU detectó algo, extender la ventana activa de esta cámara.
         # Así el sistema no entra en reposo mientras haya detecciones, aunque

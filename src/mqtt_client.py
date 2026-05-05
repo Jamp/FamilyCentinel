@@ -3,12 +3,12 @@
 Uses paho-mqtt 2.x API (CallbackAPIVersion.VERSION2).
 
 SEGURIDAD:
-  - Soporta TLS (parametro `mqtt.tls.enabled` en config.yaml). Cuando esta
+  - Soporta TLS (parámetro `mqtt.tls.enabled` en config.yaml). Cuando está
     activado, paho-mqtt valida el certificado del broker contra `ca_certs`.
-  - Las credenciales se pasan a paho via `username_pw_set` y NUNCA se
-    registran en logs (paho no las imprime y este modulo tampoco).
+  - Las credenciales se pasan a paho vía `username_pw_set` y NUNCA se
+    registran en logs (paho no las imprime y este módulo tampoco).
   - El client_id incluye el hostname del contenedor; en redes hostiles esto
-    podria ser informativo pero en una LAN domestica es aceptable y ayuda
+    podría ser informativo pero en una LAN doméstica es aceptable y ayuda
     al troubleshooting.
 
 MQTT Discovery:
@@ -39,7 +39,6 @@ log = logging.getLogger(__name__)
 # Alias kept for readability — SENSORS and ENTITIES are identical.
 SENSORS = ENTITIES
 _STATUS_TOPIC = "familycentinel/status"
-_RECONNECT_DELAY_S = 10
 
 
 class MqttClient:
